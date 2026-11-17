@@ -1,35 +1,28 @@
 #!/usr/bin/env bash
 #
 # Network Transfer Integrity and Resume Manager
-# Transfers one file to an authorized SSH destination, verifies SHA-256,
-# retries transient failures, and logs transfer status and duration.
+# Usage: ./transfer_manager.sh SOURCE_FILE user@host:/absolute/remote/dir [RETRIES] [TIMEOUT_SECONDS]
 #
-# Usage:
-#   ./transfer_manager.sh SOURCE_FILE user@host:/absolute/remote/path [RETRIES] [TIMEOUT_SECONDS]
-#
-# Requirements:
-#   bash, ssh, rsync, sha256sum, timeout
-#
-# SSH host-key checking is intentionally left enabled. Configure the host
-# in ~/.ssh/config or connect once interactively to verify its fingerprint.
+# Requires: bash, ssh, rsync, a SHA-256 utility, and timeout (or gtimeout).
+# Host-key checking remains enabled. Never use StrictHostKeyChecking=no.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/transfer.log"
-
 DEFAULT_RETRIES=3
 DEFAULT_TIMEOUT=120
+START_TIME=0
+FINISHED=0
 
 usage() {
-  echo "Usage: $0 SOURCE_FILE user@host:/absolute/remote/path [RETRIES] [TIMEOUT_SECONDS]"
+  echo "Usage: $0 SOURCE_FILE user@host:/absolute/remote/dir [RETRIES] [TIMEOUT_SECONDS]"
 }
 
 log() {
-  local message="$1"
   mkdir -p "$LOG_DIR"
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" | tee -a "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" | tee -a "$LOG_FILE"
 }
 
 die() {
@@ -37,10 +30,38 @@ die() {
   exit 1
 }
 
-command -v ssh >/dev/null 2>&1 || { echo "Missing command: ssh" >&2; exit 1; }
-command -v rsync >/dev/null 2>&1 || { echo "Missing command: rsync" >&2; exit 1; }
-command -v sha256sum >/dev/null 2>&1 || { echo "Missing command: sha256sum" >&2; exit 1; }
-command -v timeout >/dev/null 2>&1 || { echo "Missing command: timeout" >&2; exit 1; }
+on_signal() {
+  local signal="$1"
+  log "INTERRUPTED: received $signal; rsync partial data is retained where supported"
+  exit 130
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+
+# Pick GNU timeout on macOS (installed as gtimeout by Homebrew coreutils),
+# or the standard timeout command on Linux.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="$(command -v timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="$(command -v gtimeout)"
+else
+  echo "Missing timeout utility. macOS: brew install coreutils; Linux: install coreutils." >&2
+  exit 1
+fi
+
+for cmd in ssh rsync awk date basename; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Missing command: $cmd" >&2; exit 1; }
+done
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 127
+  fi
+}
 
 if [[ $# -lt 2 || $# -gt 4 ]]; then
   usage
@@ -52,88 +73,82 @@ DESTINATION="$2"
 MAX_RETRIES="${3:-$DEFAULT_RETRIES}"
 TIMEOUT_SECONDS="${4:-$DEFAULT_TIMEOUT}"
 
-[[ -f "$SOURCE_FILE" ]] || die "Source file does not exist: $SOURCE_FILE"
-[[ -r "$SOURCE_FILE" ]] || die "Source file is not readable: $SOURCE_FILE"
-[[ "$MAX_RETRIES" =~ ^[1-9][0-9]*$ ]] || die "Retries must be a positive integer"
-[[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "Timeout must be a positive integer"
+[[ -f "$SOURCE_FILE" && -r "$SOURCE_FILE" ]] || die "Source file is missing or unreadable: $SOURCE_FILE"
+[[ "$MAX_RETRIES" =~ ^[1-9][0-9]*$ ]] || die "RETRIES must be a positive integer"
+[[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "TIMEOUT_SECONDS must be a positive integer"
 
-# Require user@host:/absolute/path syntax. This avoids accepting arbitrary
-# local paths or ambiguous rsync destination forms.
 if [[ ! "$DESTINATION" =~ ^([a-zA-Z0-9._-]+)@([a-zA-Z0-9.-]+):(/[^:]*)$ ]]; then
-  die "Destination must look like user@host:/absolute/remote/path"
+  die "Destination must use user@host:/absolute/remote/directory syntax"
 fi
 REMOTE_USER="${BASH_REMATCH[1]}"
 REMOTE_HOST="${BASH_REMATCH[2]}"
 REMOTE_PATH="${BASH_REMATCH[3]}"
 
-# Restrict remote path to a conservative character set; quote it again
-# when sending it through the remote shell.
-if [[ ! "$REMOTE_PATH" =~ ^/[a-zA-Z0-9._/-]+$ ]]; then
-  die "Remote path may contain only letters, digits, dot, underscore, slash and hyphen"
-fi
+# Restrict paths and filenames to safe characters for the remote shell command.
+[[ "$REMOTE_PATH" =~ ^/[a-zA-Z0-9._/-]+$ ]] || die "Remote path may contain only letters, digits, dot, underscore, slash and hyphen"
+SOURCE_NAME="$(basename "$SOURCE_FILE")"
+[[ "$SOURCE_NAME" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Source filename may contain only letters, digits, dot, underscore and hyphen"
 
 REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+REMOTE_FILE="${REMOTE_PATH%/}/$SOURCE_NAME"
 SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=15)
 
 mkdir -p "$LOG_DIR"
-
-# Validate connectivity and destination directory before starting.
-log "Checking SSH access to $REMOTE"
-timeout "${TIMEOUT_SECONDS}s" ssh "${SSH_OPTIONS[@]}" "$REMOTE" \
-  "test -d '$REMOTE_PATH' && test -w '$REMOTE_PATH'" \
-  || die "Cannot access writable destination directory: $DESTINATION"
-
-SOURCE_NAME="$(basename -- "$SOURCE_FILE")"
-SOURCE_CHECKSUM="$(sha256sum -- "$SOURCE_FILE" | awk '{print $1}')"
-REMOTE_FILE="${REMOTE_PATH%/}/$SOURCE_NAME"
 START_TIME="$(date +%s)"
+trap 'log "EXIT: transfer manager stopped"' EXIT
 
-log "Starting transfer: $SOURCE_FILE -> $DESTINATION"
+log "Checking SSH access and destination directory: $DESTINATION"
+if ! "$TIMEOUT_CMD" "${TIMEOUT_SECONDS}s" ssh "${SSH_OPTIONS[@]}" "$REMOTE" \
+  "test -d '$REMOTE_PATH' && test -w '$REMOTE_PATH'"; then
+  die "Cannot connect or destination directory is not writable. Check SSH authorization, host key, and remote path."
+fi
+
+SOURCE_CHECKSUM="$(sha256_file "$SOURCE_FILE")" || die "No SHA-256 utility found (install coreutils or use shasum)"
 log "Source SHA-256: $SOURCE_CHECKSUM"
+log "Starting transfer: $SOURCE_FILE -> $DESTINATION"
 
 SUCCESS=0
 for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-  log "Transfer attempt $attempt of $MAX_RETRIES"
+  log "Attempt $attempt/$MAX_RETRIES"
 
-  # --partial keeps partially transferred data; --append-verify allows
-  # rsync to continue a partially transferred file while verifying data.
-  if timeout "${TIMEOUT_SECONDS}s" rsync -a --partial --append-verify \
+  # --partial retains an incomplete file. --append-verify resumes it and
+  # verifies the already-transferred portion before continuing.
+  if "$TIMEOUT_CMD" "${TIMEOUT_SECONDS}s" rsync -a --partial --append-verify \
       -e "ssh -o BatchMode=yes -o ConnectTimeout=15" \
       -- "$SOURCE_FILE" "${REMOTE}:${REMOTE_FILE}"; then
+    log "Transfer command completed; checking destination checksum"
 
-    log "Transfer command completed; verifying destination checksum"
-
-    # -- protects the remote shell command from path interpretation.
     REMOTE_CHECKSUM="$(
-      timeout "${TIMEOUT_SECONDS}s" ssh "${SSH_OPTIONS[@]}" "$REMOTE" \
-        "sha256sum -- '$REMOTE_FILE'" | awk '{print $1}'
+      "$TIMEOUT_CMD" "${TIMEOUT_SECONDS}s" ssh "${SSH_OPTIONS[@]}" "$REMOTE" \
+        "if command -v sha256sum >/dev/null 2>&1; then sha256sum '$REMOTE_FILE'; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 '$REMOTE_FILE'; else exit 127; fi" \
+        | awk 'NR==1 {print $1}'
     )" || REMOTE_CHECKSUM=""
 
     if [[ -n "$REMOTE_CHECKSUM" && "$SOURCE_CHECKSUM" == "$REMOTE_CHECKSUM" ]]; then
       SUCCESS=1
       break
     fi
-
-    log "Checksum mismatch or verification failure (source=$SOURCE_CHECKSUM, destination=${REMOTE_CHECKSUM:-unavailable})"
+    log "Checksum verification failed (source=$SOURCE_CHECKSUM, destination=${REMOTE_CHECKSUM:-unavailable})"
   else
-    TRANSFER_STATUS=$?
-    log "Transfer attempt failed with exit status $TRANSFER_STATUS"
+    status=$?
+    log "Transfer attempt failed (exit status $status)"
   fi
 
   if (( attempt < MAX_RETRIES )); then
-    DELAY=$((attempt * 2))
-    log "Retrying in ${DELAY} seconds"
-    sleep "$DELAY"
+    delay=$((attempt * 2))
+    log "Retrying in ${delay}s"
+    sleep "$delay"
   fi
 done
 
 END_TIME="$(date +%s)"
 DURATION=$((END_TIME - START_TIME))
+FINISHED=1
 
 if (( SUCCESS == 1 )); then
-  log "SUCCESS: checksum verified; duration=${DURATION}s; destination=$DESTINATION"
+  log "SUCCESS: destination checksum matches source; duration=${DURATION}s; destination=$DESTINATION"
   exit 0
-else
-  log "FAILURE: transfer or checksum verification failed after $MAX_RETRIES attempts; duration=${DURATION}s; destination=$DESTINATION"
-  exit 1
 fi
+
+log "FAILURE: transfer/checksum verification failed after $MAX_RETRIES attempts; duration=${DURATION}s; destination=$DESTINATION"
+exit 1
