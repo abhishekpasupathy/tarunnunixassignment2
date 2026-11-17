@@ -14,7 +14,6 @@ LOG_FILE="${LOG_DIR}/transfer.log"
 DEFAULT_RETRIES=3
 DEFAULT_TIMEOUT=120
 START_TIME=0
-FINISHED=0
 
 usage() {
   echo "Usage: $0 SOURCE_FILE user@host:/absolute/remote/dir [RETRIES] [TIMEOUT_SECONDS]"
@@ -143,7 +142,6 @@ done
 
 END_TIME="$(date +%s)"
 DURATION=$((END_TIME - START_TIME))
-FINISHED=1
 
 if (( SUCCESS == 1 )); then
   log "SUCCESS: destination checksum matches source; duration=${DURATION}s; destination=$DESTINATION"
